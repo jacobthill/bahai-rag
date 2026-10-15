@@ -51,14 +51,7 @@ If the question contains no IDs that match annotations, the app falls back to se
 
 ## Data conventions
 
-All data is read from `../bahai-data/data`. Two optional fields improve citations:
-
-- `page` on an annotation, e.g. `"151"`, `"43–4"`, `"214n47"`
-- `citation` on a manifestation, e.g. `"Shahvar et al., The Baha'is of Iran, Transcaspia and the Caucasus, vol. 1"`
-
-When both are present, sources are cited as "Shahvar et al., vol. 1, p. 151" instead of by manifestation ID.
-
-Copyrighted texts can be kept in `../bahai-data/data/copyright/`. Files there are loaded and merged with the main data files of the same name. The folder is optional.
+All data is read from `../bahai-data/data`, plus `../bahai-data/data/copyright/` if that folder exists. If annotations have a `page` and manifestations have a `citation`, answers cite by book and page instead of by manifestation ID.
 
 ## Evaluation
 
