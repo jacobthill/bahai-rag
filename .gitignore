@@ -1,0 +1,15 @@
+# Secrets
+.env
+
+# Python
+.venv/
+__pycache__/
+*.py[oc]
+
+# macOS
+.DS_Store
+
+# Data and generated indexes (contain corpus text; not published)
+data/
+chroma_db_rag/
+evaluation/data/

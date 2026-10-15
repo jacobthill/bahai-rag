@@ -1,0 +1,254 @@
+import os
+import json
+import shutil
+import sys
+import re
+from flask import Flask, request, jsonify, render_template
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import JSONLoader
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from dotenv import load_dotenv
+from tqdm import tqdm
+import google.generativeai as genai
+import chromadb
+
+# Load environment variables
+load_dotenv()
+
+# Disable ChromaDB telemetry
+os.environ['ANONYMIZED_TELEMETRY'] = 'False'
+
+# --- Configuration ---
+DATA_FOLDER = 'data'
+ALLOWED_EXTENSIONS = {'jsonl', 'json'}
+DB_DIRECTORY = "chroma_db_rag"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+else:
+    print("FATAL: GOOGLE_API_KEY not found in .env file.")
+    sys.exit(1)
+
+app = Flask(__name__)
+
+# --- Global Variables ---
+rag_components = {
+    "retriever": None,
+    "all_data": {}
+}
+
+# --- Utility Functions ---
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def load_all_data():
+    """Loads all data from the local data folder into memory with greedy mapping."""
+    all_data = {}
+    if not os.path.exists(DATA_FOLDER):
+        os.makedirs(DATA_FOLDER, exist_ok=True)
+        return
+
+    print(f"[*] Loading structured JSON files from '{DATA_FOLDER}'...")
+    for filename in os.listdir(DATA_FOLDER):
+        if not allowed_file(filename) or filename == "temp_docs.json":
+            continue
+
+        file_path = os.path.join(DATA_FOLDER, filename)
+        file_key = filename.rsplit('.', 1)[0]
+
+        with open(file_path, 'r', encoding='utf-8') as f:
+            try:
+                if filename.endswith(".jsonl"):
+                    data_list = [json.loads(line) for line in f if line.strip()]
+                    # Greedy capture of annotation files
+                    if 'annotation' in file_key.lower():
+                        if 'annotations' not in all_data: all_data['annotations'] = []
+                        all_data['annotations'].extend(data_list)
+                    else:
+                        all_data[file_key] = data_list
+                elif filename.endswith(".json"):
+                     all_data[file_key] = json.load(f)
+            except Exception as e:
+                print(f" [!] Error loading {filename}: {e}")
+
+    # Map lists to IDs (Greedy ID normalization)
+    for key in list(all_data.keys()):
+        if key != 'annotations' and isinstance(all_data[key], list):
+            new_map = {}
+            for item in all_data[key]:
+                if isinstance(item, dict) and item.get('id'):
+                    new_map[str(item['id'])] = item
+            all_data[key] = new_map
+
+    rag_components['all_data'] = all_data
+    print(f"[+] Successfully loaded {len(all_data.keys())} data categories into RAM.")
+
+def build_rag_index():
+    try:
+        load_all_data()
+        all_data = rag_components['all_data']
+        if not all_data: return False, "No data to index."
+
+        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+
+        if os.path.exists(DB_DIRECTORY) and os.listdir(DB_DIRECTORY):
+            print(f"[*] Loading existing vector index from '{DB_DIRECTORY}'...")
+            client = chromadb.PersistentClient(path=DB_DIRECTORY)
+            vector_store = Chroma(client=client, collection_name="rag_collection", embedding_function=embeddings)
+            rag_components["retriever"] = vector_store.as_retriever(search_kwargs={"k": 5})
+            return True, "Existing index loaded."
+
+        print(f"[*] Building new index from '{DATA_FOLDER}'...")
+        rich_documents = []
+
+        # Greedy Manifestation Retrieval
+        all_manifestations = {}
+        for key, value in all_data.items():
+            if 'manifestation' in key.lower() and isinstance(value, dict):
+                all_manifestations.update(value)
+
+        for m_id, m in all_manifestations.items():
+            if isinstance(m, dict) and m.get('text'):
+                rich_documents.append({
+                    "text": f"Manifestation: {m_id}\n{m.get('text', '')}",
+                    "metadata": {"manifestation_id": m_id}
+                })
+
+        if not rich_documents:
+            return False, "No manifestation text found to index."
+
+        temp_path = os.path.join(DATA_FOLDER, "temp_docs.json")
+        with open(temp_path, 'w', encoding='utf-8') as f: json.dump(rich_documents, f)
+        docs = JSONLoader(file_path=temp_path, jq_schema='.[].text', text_content=False).load()
+        splits = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_documents(docs)
+
+        client = chromadb.PersistentClient(path=DB_DIRECTORY)
+        vector_store = Chroma.from_documents(documents=splits, embedding=embeddings, persist_directory=DB_DIRECTORY, collection_name="rag_collection")
+        rag_components["retriever"] = vector_store.as_retriever(search_kwargs={"k": 5})
+        os.remove(temp_path)
+        return True, "New index built."
+    except Exception as e:
+        return False, f"Index build failed: {str(e)}"
+
+# --- Routes ---
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/query', methods=['POST'])
+def handle_query():
+    data = request.get_json()
+    query = data.get('query', '')
+    if not query: return jsonify({"error": "Query empty"}), 400
+
+    all_data = rag_components['all_data']
+
+    # 1. Entity Extraction (Case-Insensitive)
+    mentioned_ids = set(re.findall(r'\b(?:person|group|event|place|subject|work)_[a-zA-Z0-9_]+\b', query, re.IGNORECASE))
+    discovery_ids = {i.lower() for i in mentioned_ids if not i.lower().startswith('work_')}
+
+    # 1b. Force targeting if a specific work ID is in the query (Essential for the Historian prompt)
+    specific_work_match = re.search(r'\bwork_[a-zA-Z0-9_]+\b', query, re.IGNORECASE)
+    target_work_id = specific_work_match.group(0).lower() if specific_work_match else None
+
+    works_to_process = {}
+
+    # 2. Greedy Discovery Path
+    for key, data_map in all_data.items():
+        if 'works' in key.lower() and isinstance(data_map, dict):
+            for w_id, w in data_map.items():
+                w_id_str = str(w_id).lower()
+
+                # Check A: Specific ID match
+                if target_work_id and w_id_str == target_work_id:
+                    works_to_process[w_id_str] = w
+                    continue
+
+                # Check B: Relationship subset match
+                auth_id = (w.get('author') or {}).get('id', "").lower()
+                rec_raw = w.get('recipient') or []
+                if isinstance(rec_raw, dict): rec_raw = [rec_raw]
+                rec_ids = {str(r.get('id', "")).lower() for r in rec_raw if isinstance(r, dict)}
+
+                all_rel = rec_ids
+                if auth_id: all_rel.add(auth_id)
+
+                if discovery_ids and discovery_ids.issubset(all_rel):
+                    works_to_process[w_id_str] = w
+
+    # 3. Deep Dive with Type-Resilient Bridges
+    manifestation_texts = []
+    annotation_mentions = []
+
+    all_expressions = []
+    for k, v in all_data.items():
+        if 'expression' in k.lower() and isinstance(v, dict):
+            all_expressions.extend(v.values())
+
+    all_manifestations = {}
+    for k, v in all_data.items():
+        if 'manifestation' in k.lower() and isinstance(v, dict):
+            all_manifestations.update(v)
+
+    all_annotations = all_data.get('annotations', [])
+
+    for w_id, w in works_to_process.items():
+        # A. Traverse Expressions
+        rel_exprs = [e for e in all_expressions if str(e.get('work_id')).lower() == str(w_id).lower()]
+        for expr in rel_exprs:
+            m_ids = [m.get('manifestation_id') for m in expr.get('manifestations', []) if m.get('manifestation_id')]
+            if expr.get('canonical_manifestation_id'):
+                m_ids.append(expr.get('canonical_manifestation_id'))
+
+            for m_id in set(m_ids):
+                manif = all_manifestations.get(m_id)
+                if manif and manif.get('text'):
+                    manifestation_texts.append(f"Work: {w_id} | Manifestation: {m_id}\nContent: {manif['text']}")
+
+        # B. Search Annotations (Type-Resilient)
+        # We convert both sides to strings to ensure '17601' matches 'work_17601' or vice versa
+        rel_annots = [a for a in all_annotations if str(w_id).lower() in str(a.get('work_id', "")).lower() or str(a.get('work_id', "")).lower() in str(w_id).lower()]
+        for annot in rel_annots:
+            ent = annot.get('entity_id')
+            label = annot.get('label') or ent
+            role = annot.get('role') or "Mentioned"
+            # Flag historical markers specifically for the prompt's reasoning
+            marker_type = "HISTORICAL MARKER" if ('date' in str(annot).lower() or 'event' in str(ent).lower()) else "ENTITY"
+            annotation_mentions.append(f"- [{marker_type}] {label} ({ent}) as {role} in {w_id}")
+
+    # 4. Fallback (But prioritize Structured Evidence)
+    semantic_context = "\n\n".join(manifestation_texts)
+    if not manifestation_texts and not annotation_mentions:
+        print("[*] No structured data found, falling back to Vector Search.")
+        docs = rag_components["retriever"].invoke(query)
+        semantic_context = "\n\n".join([d.page_content for d in docs])
+
+    # 5. Synthesis
+    struct_sum = "\n".join([f"- {w.get('title') or 'Untitled'} (ID: {w_id})" for w_id, w in works_to_process.items()])
+    annot_sum = "\n".join(sorted(list(set(annotation_mentions))))
+
+    prompt = f"""Use the following context to answer:
+    STRUCTURED WORKS IDENTIFIED:
+    {struct_sum or "None"}
+
+    TEXT CONTEXT (PRIMARY EVIDENCE):
+    {semantic_context or "No relevant manifestation text found."}
+
+    ENTITY ANNOTATIONS & HISTORICAL MARKERS:
+    {annot_sum or "No specific entity mentions found in annotation records."}
+
+    QUERY: {query}
+    """
+
+    model = genai.GenerativeModel('models/gemini-pro-latest')
+    response = model.generate_content(prompt)
+    return jsonify({"status": "success", "answer": response.text})
+
+if __name__ == '__main__':
+    print("\n" + "="*50 + "\nBOOTING RAG SYSTEM\n" + "="*50)
+    success, msg = build_rag_index()
+    print(f"[*] {msg}")
+    print("="*50 + "\n")
+    app.run(debug=True, port=5005)

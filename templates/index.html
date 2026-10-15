@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dissertation RAG System</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        .spinner {
+            border: 4px solid rgba(0, 0, 0, 0.1);
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            border-left-color: #ffffff;
+            animation: spin 1s ease infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .prose-custom p { margin-bottom: 1em; }
+        .source-card {
+            border-left: 4px solid #d1d5db;
+            padding-left: 1rem;
+            margin-bottom: 1rem;
+            font-size: 0.85rem;
+            color: #4b5563;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-800">
+    <div class="container mx-auto p-4 md:p-8 max-w-4xl">
+        <header class="text-center mb-8">
+            <h1 class="text-4xl font-bold text-gray-900">Dissertation RAG System</h1>
+            <p class="text-lg text-gray-600 mt-2">Data loaded and index ready from <code>/data</code> folder.</p>
+        </header>
+
+        <div id="query-section" class="bg-white p-6 rounded-lg shadow-md">
+            <h2 class="text-2xl font-semibold mb-3 border-b pb-2">Ask a Question</h2>
+            <form id="query-form">
+                <label for="query-input" class="block text-sm font-medium text-gray-700 mb-1">Your Question:</label>
+                <textarea id="query-input" rows="3" class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500" placeholder="e.g., Tell me about the correspondence between person_bahaullah and person_varqa..."></textarea>
+                <button type="submit" id="query-btn" class="mt-3 w-full bg-green-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-700 transition flex items-center justify-center">
+                    <span id="query-btn-text">Ask</span>
+                    <div id="query-spinner" class="spinner hidden ml-3"></div>
+                </button>
+            </form>
+        </div>
+
+        <div id="results-section" class="mt-6 hidden">
+            <h2 class="text-2xl font-semibold mb-3 text-gray-900">Answer</h2>
+            <div id="result-container" class="bg-white p-6 rounded-lg shadow-md prose-custom max-w-none text-gray-700 leading-relaxed">
+                </div>
+
+            <div id="sources-container" class="mt-6">
+                <h3 class="text-xl font-semibold mb-2 text-gray-800">Sources</h3>
+                <div id="sources-list" class="space-y-4">
+                    </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const queryForm = document.getElementById('query-form');
+            const queryBtn = document.getElementById('query-btn');
+            const queryBtnText = document.getElementById('query-btn-text');
+            const querySpinner = document.getElementById('query-spinner');
+            const resultsSection = document.getElementById('results-section');
+            const resultContainer = document.getElementById('result-container');
+            const sourcesList = document.getElementById('sources-list');
+
+            queryForm.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const query = document.getElementById('query-input').value;
+                if (!query) return;
+
+                // UI State
+                queryBtn.disabled = true;
+                queryBtnText.textContent = 'Analyzing...';
+                querySpinner.classList.remove('hidden');
+                resultsSection.classList.add('hidden');
+
+                try {
+                    const response = await fetch('/query', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ query }),
+                    });
+
+                    const data = await response.json();
+                    if (response.ok) {
+                        // Formatting lines as paragraphs
+                        resultContainer.innerHTML = data.answer.split('\n').map(p => p.trim() ? `<p>${p}</p>` : '').join('');
+
+                        // Handle sources if available
+                        if (data.sources && data.sources.length > 0) {
+                            sourcesList.innerHTML = data.sources.map(s => `
+                                <div class="source-card bg-white shadow-sm rounded p-4">
+                                    <p class="font-bold text-gray-800 mb-1">Source Record:</p>
+                                    <pre class="whitespace-pre-wrap text-xs font-mono text-gray-600 bg-gray-50 p-2 border rounded">${escapeHTML(s.content)}</pre>
+                                </div>
+                            `).join('');
+                        } else {
+                            sourcesList.innerHTML = '<p class="text-gray-500 italic">No semantic source chunks returned (structured search was used).</p>';
+                        }
+                        resultsSection.classList.remove('hidden');
+                    } else {
+                        resultContainer.innerHTML = `<p class="text-red-600 font-bold">Error: ${data.message || data.error}</p>`;
+                        resultsSection.classList.remove('hidden');
+                    }
+                } catch (error) {
+                    resultContainer.innerHTML = `<p class="text-red-600 font-bold">Request failed: ${error.message}</p>`;
+                    resultsSection.classList.remove('hidden');
+                } finally {
+                    queryBtn.disabled = false;
+                    queryBtnText.textContent = 'Ask';
+                    querySpinner.classList.add('hidden');
+                }
+            });
+
+            function escapeHTML(str) {
+                return str.replace(/[&<>"']/g, m => ({'&': '&amp;','<': '&lt;','>': '&gt;','"': '&quot;',"'": '&#39;'}[m]));
+            }
+        });
+    </script>
+</body>
+</html>
