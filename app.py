@@ -1,5 +1,5 @@
 """
-app_8: app_7 plus
+RAG app (formerly app_8). Changes from app_7:
 - Mention windows: instead of a manifestation's full text, the prompt gets
   WINDOW_CHARS of context on each side of every annotated mention.
 - Page citations: an annotation may carry an optional "page" field (e.g. "151",
